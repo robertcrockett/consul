@@ -1,0 +1,60 @@
+name: get-envoy-versions
+
+# Reads the canonical ENVOY_VERSIONS file for either the current branch or a specified version of Consul,
+# and returns both the max and all supported Envoy versions.
+
+on:
+  workflow_call:
+    inputs:
+      consul-major-version:
+        description: |
+          The Consul release branch major version (e.g. 1.18) for which to determine supported Envoy versions.
+          If not provided, the current working directory is used.
+        type: string
+    outputs:
+      max-envoy-version:
+        description: The max supported Envoy version for the specified Consul version
+        value: ${{ jobs.get-envoy-versions.outputs.max-envoy-version }}
+      envoy-versions:
+        description: All supported Envoy versions for the specified Consul version (formatted as JSON array)
+        value: ${{ jobs.get-envoy-versions.outputs.envoy-versions }}
+
+jobs:
+  get-envoy-versions:
+    name: "Determine supported Envoy versions"
+    runs-on: ubuntu-latest
+    outputs:
+      max-envoy-version: ${{ steps.get-envoy-versions.outputs.max-envoy-version }}
+      go-version-previous: ${{ steps.get-envoy-versions.outputs.envoy-versions }}
+    steps:
+      - name: Determine Consul version
+        if: inputs.consul-major-version != ''
+        id: get-consul-version
+        run: |
+          CONSUL_RELEASE_BRANCH="release/${{ inputs.consul-major-version }}.x"
+          echo "Using branch ${CONSUL_RELEASE_BRANCH} to determine supported Envoy versions"
+          echo "consul-branch=${CONSUL_RELEASE_BRANCH}" >> $GITHUB_OUTPUT
+      - uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
+        with:
+          # If not set, will default to current branch.
+          ref: ${{ steps.get-consul-version.outputs.consul-branch }}
+      - name: Determine Envoy versions
+        id: get-envoy-versions
+        run: |
+          MAX_ENVOY_VERSION=$(cat envoyextensions/xdscommon/ENVOY_VERSIONS | grep '^[[:digit:]]' | sort -nr | head -n 1)
+          ENVOY_VERSIONS=$(cat envoyextensions/xdscommon/ENVOY_VERSIONS | grep '^[[:digit:]]' | sort -nr)
+          ENVOY_VERSIONS_JSON=$(echo -n '[' && echo ${ENVOY_VERSIONS} | awk '{printf "\"%s\",", $0}' | sed 's/,$//' && echo -n ']')
+          
+          # Fail if MAX_ENVOY_VERSION or ENVOY_VERSIONS cannot be detected or is not a valid Envoy version.
+          if [ -z "$MAX_ENVOY_VERSION" ] || 
+             [ -z "$ENVOY_VERSIONS" ] || 
+             ! [[ $MAX_ENVOY_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || 
+             ! [[ $ENVOY_VERSIONS =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "MAX_ENVOY_VERSION or ENVOY_VERSIONS is unset or does not match the pattern x.x.x - check Envoy versions file contents"
+            exit 1
+          fi
+          
+          echo "Supported Envoy versions: ${ENVOY_VERSIONS_JSON}"
+          echo "envoy-versions=${ENVOY_VERSIONS_JSON}" >> $GITHUB_OUTPUT
+          echo "Max supported Envoy version: ${MAX_ENVOY_VERSION}"
+          echo "max-envoy-version=${MAX_ENVOY_VERSION}" >> $GITHUB_OUTPUT

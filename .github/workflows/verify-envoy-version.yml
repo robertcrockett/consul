@@ -8,6 +8,7 @@
 
 name: Verify Envoy Version
 
+TODO make this a weekly cron and post to Slack instead of failing
 on:
   push:
     branches:

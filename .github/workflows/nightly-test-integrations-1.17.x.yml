@@ -109,7 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        envoy-version: ["1.24.12", "1.25.11", "1.26.8", "1.27.5"]
+        envoy-version: ["1.24.12", "1.25.11", "1.26.8", "1.27.5"] TODO grab this range from the 1.17 branch
         xds-target: ["server", "client"]
         test-cases: ${{ fromJSON(needs.generate-envoy-job-matrices.outputs.envoy-matrix) }}
     env:
@@ -207,7 +207,7 @@ jobs:
         consul-version: ["1.15", "1.16", "1.17"]
     env:
       CONSUL_LATEST_VERSION: ${{ matrix.consul-version }}
-      ENVOY_VERSION: "1.24.6"
+      ENVOY_VERSION: TODO grab this from the 1.17 release branch
     steps:
       - name: Checkout code
         uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4

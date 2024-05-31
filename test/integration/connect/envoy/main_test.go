@@ -7,6 +7,7 @@ package envoy
 
 import (
 	"flag"
+	"github.com/hashicorp/consul/envoyextensions/xdscommon"
 	"io/ioutil"
 	"log"
 	"os"
@@ -59,6 +60,8 @@ func runCmdLinux(t *testing.T, c string, env ...string) {
 
 	cmd := exec.Command("./run-tests.sh", c)
 	cmd.Env = append(os.Environ(), env...)
+	// Default to latest supported Envoy version
+	cmd.Env = append(cmd.Env, "ENVOY_VERSION="+xdscommon.GetMaxEnvoyVersion())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -76,6 +79,8 @@ func runCmdWindows(t *testing.T, c string, env ...string) {
 
 	cmd := exec.Command("cmd", "/C", "bash run-tests.windows.sh", c, param_5)
 	cmd.Env = append(os.Environ(), env...)
+	// Default to latest supported Envoy version
+	cmd.Env = append(cmd.Env, "ENVOY_VERSION="+xdscommon.GetMaxEnvoyVersion())
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

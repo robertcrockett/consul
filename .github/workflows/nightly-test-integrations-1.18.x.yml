@@ -113,7 +113,7 @@ jobs:
         xds-target: ["server", "client"]
         test-cases: ${{ fromJSON(needs.generate-envoy-job-matrices.outputs.envoy-matrix) }}
     env:
-      ENVOY_VERSION: ${{ matrix.envoy-version }}
+      ENVOY_VERSION: ${{ matrix.envoy-version }} TODO grab this range from the 1.18 branch
       XDS_TARGET: ${{ matrix.xds-target }}
       AWS_LAMBDA_REGION: us-west-2
     steps:
@@ -207,7 +207,7 @@ jobs:
         consul-version: ["1.15", "1.16", "1.17"]
     env:
       CONSUL_LATEST_VERSION: ${{ matrix.consul-version }}
-      ENVOY_VERSION: "1.24.6"
+      ENVOY_VERSION: TODO grab this from the 1.18 branch
     steps:
       - name: Checkout code
         uses: actions/checkout@0ad4b8fadaa221de15dcec353f45205ec38ea70b # v4.1.4
