@@ -66,6 +66,7 @@ import (
 	"github.com/hashicorp/consul/internal/auth"
 	"github.com/hashicorp/consul/internal/catalog"
 	"github.com/hashicorp/consul/internal/controller"
+	"github.com/hashicorp/consul/internal/gossip/librtt"
 	hcpctl "github.com/hashicorp/consul/internal/hcp"
 	"github.com/hashicorp/consul/internal/mesh"
 	proxysnapshot "github.com/hashicorp/consul/internal/mesh/proxy-snapshot"
@@ -132,7 +133,7 @@ const (
 
 	LeaderTransferMinVersion      = "1.6.0"
 	CatalogResourceExperimentName = "resource-apis"
-	V2DNSExperimentName           = "v2dns"
+	V1DNSExperimentName           = "v1dns"
 	V2TenancyExperimentName       = "v2tenancy"
 	HCPAllowV2ResourceAPIs        = "hcp-v2-resource-apis"
 )
@@ -854,6 +855,7 @@ func NewServer(config *Config, flat Deps, externalGRPCServer *grpc.Server,
 			WithStateProvider(s.fsm).
 			WithLogger(s.logger).
 			WithDatacenter(s.config.Datacenter).
+			WithDisabledTenancyMetrics(s.config.DisablePerTenancyUsageMetrics).
 			WithReportingInterval(s.config.MetricsReportingInterval).
 			WithGetMembersFunc(func() []serf.Member {
 				members, err := s.lanPoolAllMembers()
@@ -1957,13 +1959,13 @@ func (s *Server) Stats() map[string]map[string]string {
 // are ancillary members of.
 //
 // NOTE: This assumes coordinates are enabled, so check that before calling.
-func (s *Server) GetLANCoordinate() (lib.CoordinateSet, error) {
+func (s *Server) GetLANCoordinate() (librtt.CoordinateSet, error) {
 	lan, err := s.serfLAN.GetCoordinate()
 	if err != nil {
 		return nil, err
 	}
 
-	cs := lib.CoordinateSet{"": lan}
+	cs := librtt.CoordinateSet{"": lan}
 	if err := s.addEnterpriseLANCoordinates(cs); err != nil {
 		return nil, err
 	}

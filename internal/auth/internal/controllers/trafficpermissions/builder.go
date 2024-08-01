@@ -48,7 +48,7 @@ func newTrafficPermissionsBuilder(
 func track[S types.XTrafficPermissions](tpb *trafficPermissionsBuilder, xtp *resource.DecodedResource[S]) {
 	tpb.brc.AddRefOrID(xtp.Id)
 
-	missingSamenessGroups := tpb.sgExpander.Expand(xtp.Data, tpb.sgMap)
+	permissions, missingSamenessGroups := tpb.sgExpander.Expand(xtp.Data, tpb.sgMap)
 
 	if len(missingSamenessGroups) > 0 {
 		tpb.missing[resource.NewReferenceKey(xtp.Id)] = missingSamenessGroupReferences{
@@ -60,9 +60,9 @@ func track[S types.XTrafficPermissions](tpb *trafficPermissionsBuilder, xtp *res
 	tpb.isDefault = false
 
 	if xtp.Data.GetAction() == pbauth.Action_ACTION_ALLOW {
-		tpb.allowedPermissions = append(tpb.allowedPermissions, xtp.Data.GetPermissions()...)
+		tpb.allowedPermissions = append(tpb.allowedPermissions, permissions...)
 	} else {
-		tpb.denyPermissions = append(tpb.denyPermissions, xtp.Data.GetPermissions()...)
+		tpb.denyPermissions = append(tpb.denyPermissions, permissions...)
 	}
 }
 

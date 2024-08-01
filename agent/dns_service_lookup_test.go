@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"testing"
@@ -25,7 +26,6 @@ func TestDNS_ServiceLookupNoMultiCNAME(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -88,7 +88,6 @@ func TestDNS_ServiceLookupPreferNoCNAME(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -154,7 +153,6 @@ func TestDNS_ServiceLookupMultiAddrNoCNAME(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -223,10 +221,20 @@ func TestDNS_ServiceLookupMultiAddrNoCNAME(t *testing.T) {
 			in, _, err := c.Exchange(m, a.DNSAddr())
 			require.NoError(t, err)
 
-			// expect a CNAME and an A RR
+			// expect two A RRs
 			require.Len(t, in.Answer, 2)
 			require.IsType(t, &dns.A{}, in.Answer[0])
+			require.Equal(t, "db.service.consul.", in.Answer[0].Header().Name)
+			isOneOfTheseIPs := func(ip net.IP) bool {
+				if ip.Equal(net.ParseIP("198.18.0.1")) || ip.Equal(net.ParseIP("198.18.0.3")) {
+					return true
+				}
+				return false
+			}
+			require.True(t, isOneOfTheseIPs(in.Answer[0].(*dns.A).A))
 			require.IsType(t, &dns.A{}, in.Answer[1])
+			require.Equal(t, "db.service.consul.", in.Answer[1].Header().Name)
+			require.True(t, isOneOfTheseIPs(in.Answer[1].(*dns.A).A))
 		})
 	}
 }
@@ -373,15 +381,111 @@ func TestDNS_ServiceLookup(t *testing.T) {
 	}
 }
 
-// TODO (v2-dns): this is formulating the correct response
-// but failing with an I/O timeout on the dns client Exchange() call
+// TestDNS_ServiceAddressWithTagLookup tests some specific cases that Nomad would exercise,
+// Like registering a service w/o a Node. https://github.com/hashicorp/nomad/blob/1174019676ff3d65b39323eb0c7234fb1e09b80c/command/agent/consul/service_client.go#L1366-L1381
+// Errors with this were reported in https://github.com/hashicorp/consul/issues/21325#issuecomment-2166845574
+// Also we test that only one tag is valid in the URL.
+func TestDNS_ServiceAddressWithTagLookup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	for name, experimentsHCL := range getVersionHCL(true) {
+		t.Run(name, func(t *testing.T) {
+			a := NewTestAgent(t, experimentsHCL)
+			defer a.Shutdown()
+			testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+			{
+				// This emulates a Nomad service registration.
+				// Using an internal RPC for Catalog.Register will not trigger the same condition.
+				err := a.Client().Agent().ServiceRegister(&api.AgentServiceRegistration{
+					Kind:    api.ServiceKindTypical,
+					ID:      "db-1",
+					Name:    "db",
+					Tags:    []string{"primary"},
+					Address: "127.0.0.1",
+					Port:    12345,
+					Checks:  make([]*api.AgentServiceCheck, 0),
+				})
+				require.NoError(t, err)
+			}
+
+			{
+				err := a.Client().Agent().ServiceRegister(&api.AgentServiceRegistration{
+					Kind:    api.ServiceKindTypical,
+					ID:      "db-2",
+					Name:    "db",
+					Tags:    []string{"secondary"},
+					Address: "127.0.0.2", // The address here has to be different, or the DNS server will dedupe it.
+					Port:    12345,
+					Checks:  make([]*api.AgentServiceCheck, 0),
+				})
+				require.NoError(t, err)
+			}
+
+			// Query the service using a tag - this also checks that we're filtering correctly
+			questions := []string{
+				"_db._primary.service.dc1.consul.", // w/ RFC 2782 style syntax
+				"primary.db.service.dc1.consul.",
+			}
+			for _, question := range questions {
+				m := new(dns.Msg)
+				m.SetQuestion(question, dns.TypeSRV)
+
+				c := new(dns.Client)
+				in, _, err := c.Exchange(m, a.DNSAddr())
+				require.NoError(t, err)
+				require.Len(t, in.Answer, 1, "Expected only one result in the Answer section")
+
+				srvRec, ok := in.Answer[0].(*dns.SRV)
+				require.True(t, ok, "Expected an SRV record in the Answer section")
+				require.Equal(t, uint16(12345), srvRec.Port)
+				require.Equal(t, "7f000001.addr.dc1.consul.", srvRec.Target)
+
+				aRec, ok := in.Extra[0].(*dns.A)
+				require.True(t, ok, "Expected an A record in the Extra section")
+				require.Equal(t, "7f000001.addr.dc1.consul.", aRec.Hdr.Name)
+				require.Equal(t, "127.0.0.1", aRec.A.String())
+
+				if strings.Contains(question, "query") {
+					// The query should have the TTL associated with the query registration.
+					require.Equal(t, uint32(3), srvRec.Hdr.Ttl)
+					require.Equal(t, uint32(3), aRec.Hdr.Ttl)
+				} else {
+					require.Equal(t, uint32(0), srvRec.Hdr.Ttl)
+					require.Equal(t, uint32(0), aRec.Hdr.Ttl)
+				}
+			}
+
+			// Multiple tags are not supported in the legacy DNS server
+			questions = []string{
+				"banana._db._primary.service.dc1.consul.",
+			}
+			for _, question := range questions {
+				m := new(dns.Msg)
+				m.SetQuestion(question, dns.TypeSRV)
+
+				c := new(dns.Client)
+				in, _, err := c.Exchange(m, a.DNSAddr())
+				require.NoError(t, err)
+				require.Len(t, in.Answer, 0, "Expected no results in the Answer section")
+
+				// For v1dns, we combine the tags with a period, which results in NXDOMAIN
+				// For v2dns, we are also return NXDomain
+				// The reported issue says that v2dns this is returning valid results.
+				require.Equal(t, dns.RcodeNameError, in.Rcode)
+			}
+		})
+	}
+}
+
 func TestDNS_ServiceLookupWithInternalServiceAddress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
-	for name, experimentsHCL := range getVersionHCL(false) {
+	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, `
 		node_name = "my.test-node"
@@ -605,7 +709,6 @@ func TestDNS_ExternalServiceLookup(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -671,7 +774,6 @@ func TestDNS_ExternalServiceToConsulCNAMELookup(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, `
@@ -777,8 +879,7 @@ func TestDNS_ExternalServiceToConsulCNAMENestedLookup(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
-	for name, experimentsHCL := range getVersionHCL(false) {
+	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, `
 		node_name = "test-node"
@@ -1119,7 +1220,6 @@ func TestDNS_ServiceLookup_ServiceAddress_SRV(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	recursor := makeRecursor(t, dns.Msg{
 		Answer: []dns.RR{
 			dnsCNAME("www.google.com", "google.com"),
@@ -1662,7 +1762,6 @@ func TestDNS_ServiceLookup_CaseInsensitive(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	tests := []struct {
 		name   string
 		config string
@@ -1680,7 +1779,7 @@ func TestDNS_ServiceLookup_CaseInsensitive(t *testing.T) {
 	}
 	for _, tst := range tests {
 		t.Run(fmt.Sprintf("A lookup %v", tst.name), func(t *testing.T) {
-			for name, experimentsHCL := range getVersionHCL(false) {
+			for name, experimentsHCL := range getVersionHCL(true) {
 				t.Run(name, func(t *testing.T) {
 					a := NewTestAgent(t, fmt.Sprintf("%s %s", tst.config, experimentsHCL))
 					defer a.Shutdown()
@@ -1765,7 +1864,6 @@ func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(false) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -1836,6 +1934,49 @@ func TestDNS_ServiceLookup_TagPeriod(t *testing.T) {
 			if aRec.A.String() != "127.0.0.1" {
 				t.Fatalf("Bad: %#v", in.Extra[0])
 			}
+		})
+	}
+}
+
+// TestDNS_ServiceLookup_ExtraTags tests tag behavior.
+// With v1dns, we still support period tags, but if a tag is not found it's an NXDOMAIN code.
+// With v2dns, we do not support period tags, so it's an NXDOMAIN code because the name is not valid.
+func TestDNS_ServiceLookup_ExtraTags(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+
+	for name, experimentsHCL := range getVersionHCL(true) {
+		t.Run(name, func(t *testing.T) {
+			a := NewTestAgent(t, experimentsHCL)
+			defer a.Shutdown()
+			testrpc.WaitForLeader(t, a.RPC, "dc1")
+
+			// Register node
+			args := &structs.RegisterRequest{
+				Datacenter: "dc1",
+				Node:       "foo",
+				Address:    "127.0.0.1",
+				Service: &structs.NodeService{
+					Service: "db",
+					Tags:    []string{"primary"},
+					Port:    12345,
+				},
+			}
+
+			var out struct{}
+			if err := a.RPC(context.Background(), "Catalog.Register", args, &out); err != nil {
+				t.Fatalf("err: %v", err)
+			}
+
+			m1 := new(dns.Msg)
+			m1.SetQuestion("dummy.primary.db.service.consul.", dns.TypeSRV)
+
+			c1 := new(dns.Client)
+			in, _, err := c1.Exchange(m1, a.DNSAddr())
+			require.NoError(t, err)
+			require.Len(t, in.Answer, 0, "Expected no answer")
+			require.Equal(t, dns.RcodeNameError, in.Rcode)
 		})
 	}
 }
@@ -1926,14 +2067,12 @@ func TestDNS_ServiceLookup_PreparedQueryNamePeriod(t *testing.T) {
 	}
 }
 
-// TODO (v2-dns): this requires a prepared query
 func TestDNS_ServiceLookup_Dedup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
-	for name, experimentsHCL := range getVersionHCL(false) {
+	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
 			defer a.Shutdown()
@@ -3080,7 +3219,6 @@ func TestDNS_ServiceLookup_ARecordLimits(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	tests := []struct {
 		name                   string
 		aRecordLimit           int
@@ -3133,28 +3271,23 @@ func TestDNS_ServiceLookup_ARecordLimits(t *testing.T) {
 		test := test // capture loop var
 
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
 
 			// All those queries should have at max queriesLimited elements
 
 			t.Run("A", func(t *testing.T) {
-				t.Parallel()
 				checkDNSService(t, test.numNodesTotal, test.aRecordLimit, dns.TypeA, test.expectedAResults, test.udpSize)
 			})
 
 			t.Run("AAAA", func(t *testing.T) {
-				t.Parallel()
 				checkDNSService(t, test.numNodesTotal, test.aRecordLimit, dns.TypeAAAA, test.expectedAAAAResults, test.udpSize)
 			})
 
 			t.Run("ANY", func(t *testing.T) {
-				t.Parallel()
 				checkDNSService(t, test.numNodesTotal, test.aRecordLimit, dns.TypeANY, test.expectedANYResults, test.udpSize)
 			})
 
 			// No limits but the size of records for SRV records, since not subject to randomization issues
 			t.Run("SRV", func(t *testing.T) {
-				t.Parallel()
 				checkDNSService(t, test.expectedSRVResults, test.aRecordLimit, dns.TypeSRV, test.numNodesTotal, test.udpSize)
 			})
 		})
@@ -3208,7 +3341,6 @@ func TestDNS_ServiceLookup_AnswerLimits(t *testing.T) {
 			for _, test := range tests {
 				test := test // capture loop var
 				t.Run(fmt.Sprintf("A lookup %v", test), func(t *testing.T) {
-					t.Parallel()
 					ok, err := testDNSServiceLookupResponseLimits(t, test.udpAnswerLimit, dns.TypeA, test.expectedAService, test.expectedAQuery, test.expectedAQueryID, experimentsHCL)
 					if !ok {
 						t.Fatalf("Expected service A lookup %s to pass: %v", test.name, err)
@@ -3216,7 +3348,6 @@ func TestDNS_ServiceLookup_AnswerLimits(t *testing.T) {
 				})
 
 				t.Run(fmt.Sprintf("AAAA lookup %v", test), func(t *testing.T) {
-					t.Parallel()
 					ok, err := testDNSServiceLookupResponseLimits(t, test.udpAnswerLimit, dns.TypeAAAA, test.expectedAAAAService, test.expectedAAAAQuery, test.expectedAAAAQueryID, experimentsHCL)
 					if !ok {
 						t.Fatalf("Expected service AAAA lookup %s to pass: %v", test.name, err)
@@ -3224,7 +3355,6 @@ func TestDNS_ServiceLookup_AnswerLimits(t *testing.T) {
 				})
 
 				t.Run(fmt.Sprintf("ANY lookup %v", test), func(t *testing.T) {
-					t.Parallel()
 					ok, err := testDNSServiceLookupResponseLimits(t, test.udpAnswerLimit, dns.TypeANY, test.expectedANYService, test.expectedANYQuery, test.expectedANYQueryID, experimentsHCL)
 					if !ok {
 						t.Fatalf("Expected service ANY lookup %s to pass: %v", test.name, err)
@@ -3240,7 +3370,6 @@ func TestDNS_ServiceLookup_CNAME(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	recursor := makeRecursor(t, dns.Msg{
 		Answer: []dns.RR{
 			dnsCNAME("www.google.com", "google.com"),
@@ -3345,7 +3474,6 @@ func TestDNS_ServiceLookup_ServiceAddress_CNAME(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	recursor := makeRecursor(t, dns.Msg{
 		Answer: []dns.RR{
 			dnsCNAME("www.google.com", "google.com"),
@@ -3451,7 +3579,6 @@ func TestDNS_ServiceLookup_TTL(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, `
@@ -3537,7 +3664,6 @@ func TestDNS_ServiceLookup_SRV_RFC(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -3619,7 +3745,6 @@ func TestDNS_ServiceLookup_SRV_RFC_TCP_Default(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	for name, experimentsHCL := range getVersionHCL(true) {
 		t.Run(name, func(t *testing.T) {
 			a := NewTestAgent(t, experimentsHCL)
@@ -3720,7 +3845,6 @@ func TestDNS_ServiceLookup_FilterACL(t *testing.T) {
 		t.Skip("too slow for testing.Short")
 	}
 
-	t.Parallel()
 	tests := []struct {
 		token   string
 		results int
